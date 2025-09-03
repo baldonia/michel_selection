@@ -14,45 +14,37 @@ class Run:
     def __init__(self, file, nevents):
         self.file = Path(file) 
         self.nevents = nevents
-
         # Root file variables 
         self.meta_data = None
         self.output_data = None
-
         # Is Online
         self.pmt_is_online = None 
-
         # Hit cleaning masks
-        self.hit_amp_cut = None
-        self.hit_charge_cut = None
-        self.hit_time_cut = None        
-
-        # Hit cleaning settings
-        self.time_cut = [-10, 15]
-        self.amp_cut = 3
-
+        self.hit_amp_mask = None
+        self.hit_charge_mask = None
+        self.hit_time_mask = None        
+        self.hit_tof = None
+        self.delayed_delta_t_range = [1,5] # us
         # Hit cleaned data
         self.clean_charges = None
         self.clean_nhit = None
-
         # Event selection masks 
         self.prompt_raw_mask = None
         self.delayed_raw_mask = None 
         self.prompt_clean_mask = None 
         self.delayed_clean_mask = None 
-
         # Event selected data
         self.delayed_dt = None
         self.delayed_dt_mask = None 
         self.final_event_mask = None 
+        self.final_background_mask = None
         self.final_charges = None 
-
+        self.background_charges = None
         # Timing variables for plotting
         self.clock_period = 0.5  # us
         self.start_time = 1 #3 * 0.432 + self.clock_period # 0  # e.g., 0.864 us
         self.nclock_cycles_to_plot = 40
         self.stop_time = self.start_time + (self.nclock_cycles_to_plot) * self.clock_period  # e.g., 0.912
-
         # PMT ids for plotting  
         self.barrel_ids = None 
         self.bottom_ids = None 
@@ -74,7 +66,10 @@ class Run:
             'pmtChannel',
             'pmtIsOnline',
             'pmtCableOffset',
-        ], entry_start=0, entry_stop=self.nevents, library='ak') 
+            'pmtX',
+            'pmtY',
+            'pmtZ',
+        ], entry_start=0, entry_stop=1, library='ak') 
         stop = time.time()
         print(f"Took {stop-start:.2f} seconds to load meta data for {self.nevents} events")
 
@@ -99,48 +94,97 @@ class Run:
         print(f"Took {stop-start:.2f} seconds to load output data for {self.nevents} events")
 
     # step 1
-    def apply_hit_cleaning(self):
-        # Make hit amplitude ratio hit cut
-        hitcleanmask = self.output_data['digitHitCleaningMask']
-        hit_amp_cut = hitcleanmask<1
-        
-        # Make positive charge hit cut 
-        charges = self.output_data['digitCharge']
-        hit_charge_cut = charges > 0
+    def make_hit_cleaning_masks(self,time_cut):
 
-        # Make time cut
+      # Amplitude mask 
+      self.hit_amp_mask = ((self.output_data['digitHitCleaningMask'] >> 1) & 1) == 0
+      # Charge mask 
+      charge = self.output_data['digitCharge']
+      self.hit_charge_mask = charge > 0
+      # Timing mask 
+      hit_time = self.output_data['digitTime']
+      # Event (fit) time correction
+      event_time = self.output_data['time_quadfitter']
+      event_time = ak.broadcast_arrays(hit_time, event_time)[1]
+      hit_time = hit_time - event_time   # subtract event (fit) time
+      # Time-of-flight correction 
+      hit_id = self.output_data['digitPMTID']
+      fitx = ak.broadcast_arrays(hit_id, self.output_data['x_quadfitter'])[1]
+      fity = ak.broadcast_arrays(hit_id, self.output_data['y_quadfitter'])[1]
+      fitz = ak.broadcast_arrays(hit_id, self.output_data['z_quadfitter'])[1]
+      pmtX = ak.Array(self.meta_data['pmtX'][0])
+      pmtY = ak.Array(self.meta_data['pmtY'][0])
+      pmtZ = ak.Array(self.meta_data['pmtZ'][0])
+      hitx_flat = pmtX[ak.flatten(hit_id)]
+      hity_flat = pmtY[ak.flatten(hit_id)]
+      hitz_flat = pmtZ[ak.flatten(hit_id)]
+      hitx = ak.unflatten(hitx_flat, ak.num(hit_id))
+      hity = ak.unflatten(hity_flat, ak.num(hit_id))
+      hitz = ak.unflatten(hitz_flat, ak.num(hit_id)) 
+      dist = np.sqrt((fitx - hitx)**2 + (fity - hity)**2 + (fitz - hitz)**2)
+      self.hit_tof = dist / 224 # speed of light in water [mm/ns]
+      hit_time = hit_time - self.hit_tof
+      self.hit_time_mask = (hit_time > time_cut[0]) & (hit_time < time_cut[1])
+
+    # step 1.5 verify timing corrections in step 1
+    def plot_timing_corrections(self, time_cut):
+
+        plt.figure(figsize=(12, 6))
+        # Raw times
         times = self.output_data['digitTime']
+        plt.hist(ak.flatten(times), bins=400, range=(-150, 150), histtype='step',label='Digit Hit Time', color='tab:blue')\
+        # Event (fit) time correction
         event_times = self.output_data['time_quadfitter']
         event_times = ak.broadcast_arrays(times, event_times)[1]
-        times = times - event_times
-        cut = self.time_cut
-        hit_time_cut = (times > cut[0]) & (times < cut[1])
+        times_ev = times - event_times
+        plt.hist(ak.flatten(event_times), bins=400, range=(-150, 150), histtype='step', label='Reco Event Time', color='tab:red')
+        plt.hist(ak.flatten(times_ev), bins=400, range=(-150, 150), histtype='step', label='Digit Hit Time - Reco Event Time', color='tab:orange')
+        # Time-of-flight correction
+        times_ev_tof = times_ev - self.hit_tof
+        plt.hist(ak.flatten(times_ev_tof), bins=400, range=(-150, 150), histtype='step', label='Digit Hit Time - Reco Event Time - TOF', color='tab:green')
+        plt.axvspan(time_cut[0], time_cut[1], color='grey', alpha=0.2)
+        plt.xlabel('Hit Time [ns]')
+        plt.ylabel('Counts')
+        plt.title('Hit Times Across All Channels and Events')
+        plt.legend(fontsize=14)
+        plt.tight_layout()
+        plt.yscale('log')
+        plt.show()
 
-        # Save important stuff
-        self.hit_amp_cut = hit_amp_cut
-        self.hit_charge_cut = hit_charge_cut
-        self.hit_time_cut = hit_time_cut
-
+        plt.figure(figsize=(12, 6))
+        plt.hist(ak.flatten(times), bins=400, range=(-150, 150), histtype='step',label='Digit Hit Time', color='tab:blue')
+        plt.hist(ak.flatten(event_times), bins=400, range=(-150, 150), histtype='step', label='Reco Event Time', color='tab:red')
+        plt.hist(ak.flatten(times_ev), bins=400, range=(-150, 150), histtype='step', label='Digit Hit Time - Reco Event Time', color='tab:orange')
+        plt.hist(ak.flatten(times_ev_tof), bins=400, range=(-150, 150), histtype='step', label='Digit Hit Time - Reco Event Time - TOF', color='tab:green')
+        plt.axvspan(time_cut[0], time_cut[1], color='grey', alpha=0.2)
+        plt.xlabel('Hit Time [ns]')
+        plt.ylabel('Counts')
+        plt.title('Hit Times Across All Channels and Events')
+        plt.legend(fontsize=14)
+        plt.tight_layout()
+        plt.show()
 
     # step 2
-    def make_nhit_masks(self):
+    def make_nhit_masks_and_plot_hit_cleaning_effect(self):
 
         # Get raw data
         charges = self.output_data['digitCharge']
 
         # Apply hit cuts individually for diagnostics   
-        amp_charges = ak.mask(charges, self.hit_amp_cut)
-        charge_charges = ak.mask(charges, self.hit_charge_cut) # don't use this anymore, encapulates in amp cut
-        time_charges = ak.mask(charges, self.hit_time_cut)
+        amp_charges = ak.mask(charges, self.hit_amp_mask)
+        charge_charges = ak.mask(charges, self.hit_charge_mask) 
+        time_charges = ak.mask(charges, self.hit_time_mask)
 
         # Apply all hit cuts together
-        clean_charges = ak.mask(charges, self.hit_amp_cut & self.hit_time_cut)
+        clean_charges = ak.mask(charges, self.hit_amp_mask & self.hit_time_mask & self.hit_charge_mask)
 
         # Calculate NHits
         raw_nhit = ak.count(charges, axis=1)
         amp_nhit = ak.count(amp_charges, axis=1)
+        charge_nhit = ak.count(charge_charges, axis=1) 
         time_nhit = ak.count(time_charges, axis=1)
         clean_nhit = ak.count(clean_charges, axis=1)
+        print(f"Average NHits: raw {ak.mean(raw_nhit):.1f}, amp {ak.mean(amp_nhit):.1f}, charge {ak.mean(charge_charges):.1f}, time {ak.mean(time_nhit):.1f}, clean {ak.mean(clean_nhit):.1f}")
 
         # Save important stuff
         self.clean_charges = clean_charges
@@ -149,6 +193,7 @@ class Run:
         # Flatten charges for plotting
         charges = ak.to_numpy(ak.flatten(charges))
         amp_charges = ak.to_numpy(ak.flatten(amp_charges))
+        charge_charges = ak.to_numpy(ak.flatten(charge_charges))
         time_charges = ak.to_numpy(ak.flatten(time_charges))
         clean_charges = ak.to_numpy(ak.flatten(clean_charges))
 
@@ -178,15 +223,16 @@ class Run:
         plt.figure(figsize=(10,5))
         plt.hist(raw_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='black',label=f"Raw data")#: {raw_prompt} prompt {raw_delayed} delayed");
         plt.hist(amp_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='green',label=f"After amplitude hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.hist(charge_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='blue',label=f"After charge hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
         plt.hist(time_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='orange',label=f"After time hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
-        plt.hist(clean_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='purple',label=f"After amplitude + time hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.hist(clean_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='purple',label=f"After amplitude + charge + time hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
         plt.title('EOS Run 3056 (Water Fill)',fontsize=fontsize)
         plt.xlabel('NHits',fontsize=fontsize)
         plt.ylabel('Number of Events',fontsize=fontsize)
         #plt.axvspan(125,200,color='blue',alpha=0.1,label='Stopping Muon Candidates')
         #plt.axvspan(50,125,color='red',alpha=0.1,label='Michel Electron Candidates')
         plt.semilogy()
-        plt.legend(ncol=1,loc='upper right',bbox_to_anchor=(2.5,1))
+        plt.legend(fontsize=14)
 
         # Plot total charge
         charge_range = (-10,10)
@@ -199,8 +245,7 @@ class Run:
         plt.xlabel('Digit Charge [pC]',fontsize=fontsize)
         plt.ylabel('Number of Events',fontsize=fontsize)
         plt.semilogy()
-        plt.legend(ncol=1,loc='upper right',bbox_to_anchor=(2.5,1))
-
+        plt.legend(fontsize=14)
 
 
 
@@ -243,7 +288,8 @@ class Run:
         print(len(delayed_clean_mask),delayed_clean_mask)
 
         # Apply delay time cut (dt < 3 µs) to delayed events
-        time_mask = (self.start_time < dt_clean/1e3) & (dt_clean/1e3 <= self.stop_time)   # [delayed events only]
+        time_mask = (self.delayed_delta_t_range[0] < dt_clean/1e3) & (dt_clean/1e3 <= self.delayed_delta_t_range[1])   # [delayed events only]
+        background_time_mask = (20 < dt_clean/1e3) & (dt_clean/1e3 < 400)
 
         print(len(time_mask),time_mask)
         
@@ -254,22 +300,28 @@ class Run:
         delayed_indices = ak.where(delayed_clean_mask)[0]  # np.array of indices
         # Apply time cut
         valid_delayed_indices = delayed_indices[time_mask]  # np.array of surviving delayed event indices
+        background_delayed_indices = delayed_indices[background_time_mask]
         
         # Now build final event-level mask
         final_event_mask = np.zeros(len(delayed_clean_mask), dtype=bool)
         final_event_mask[valid_delayed_indices] = True  # shape: [event]
 
+        final_background_mask = np.zeros(len(delayed_clean_mask), dtype=bool) 
+        final_background_mask[background_delayed_indices] = True
+
         print(len(final_event_mask),final_event_mask)
+        print(len(final_background_mask), final_background_mask)
         
         # Final cleaned arrays (hits within selected delayed events)
         digit_charge_final = clean_charges[final_event_mask]
-
+        digit_charge_background = clean_charges[final_background_mask]
 
         # Save important stuff
         self.delayed_dt_mask = time_mask
         self.final_event_mask = final_event_mask
         self.final_charges = digit_charge_final
-
+        self.final_background_mask = final_background_mask
+        self.background_charges = digit_charge_background
         
     # Optional Plotting
     def plot_final_nhit_charges(self):
@@ -474,7 +526,7 @@ class Run:
                 array = array - event_times
             #FIXME better to do hit cleaning to all hit variables
             if key in ['digitPMTID', 'digitTime', 'digitCharge']:
-                array = ak.mask(array, self.hit_amp_cut & self.hit_time_cut)
+                array = ak.mask(array, self.hit_amp_mask & self.hit_time_mask & self.hit_charge_mask)
                 array = ak.drop_none(array)
             selected_output_arrays[key] = array[final_event_mask]
         
@@ -498,10 +550,10 @@ class SimRun:
 
     
         # Hit cleaning masks
-        # self.hit_amp_cut = None
-        self.hit_id_cut = None
-        self.hit_charge_cut = None
-        self.hit_time_cut = None        
+        self.hit_amp_mask = None
+        self.hit_id_mask = None
+        self.hit_charge_mask = None
+        self.hit_time_mask = None        
 
         # Hit cleaned data
         self.clean_charges = None
@@ -552,6 +604,9 @@ class SimRun:
             'pmtChannel',
             'pmtIsOnline',
             'pmtCableOffset',
+            'pmtX',
+            'pmtY',
+            'pmtZ',
         ], entry_start=0, entry_stop=1, library='ak') 
         stop = time.time()
         print(f"Took {stop-start:.2f} seconds to load meta data for {self.nevents} events")
@@ -568,6 +623,7 @@ class SimRun:
             'digitTime',
             'digitCharge',
             'digitPeak',
+            'digitHitCleaningMask',
             'x_quadfitter',
             'y_quadfitter',
             'z_quadfitter',
@@ -577,75 +633,122 @@ class SimRun:
         print(f"Took {stop-start:.2f} seconds to load output data for {self.nevents} events")
 
     # step 1
-    def apply_hit_cleaning(self):
-        # # Make hit amplitude ratio hit cut
-        # digit_peak = self.output_data['digitPeak']
-        # digit_neg_peak = self.output_data['digitNegativePeak']
-        # ratio = digit_peak / digit_neg_peak
-        # hit_amp_cut = ratio > 2
+    def make_hit_cleaning_masks(self,time_cut):
 
-        # Check that the PMT is online
+      # Online channel id mask
+      #pmt_is_online = np.asarray(self.pmt_is_online)  # shape (241,), bool
+      #ids = self.output_data['digitPMTID']  # shape [event][hit]
+      #flat_ids = ak.flatten(ids)                                # shape [total_hits]
+      #flat_mask = pmt_is_online[flat_ids]                        # shape [total_hits], bool
+      #self.hit_id_mask = ak.unflatten(flat_mask, ak.num(ids, axis=1))  # shape [event][hit]
+      # Amplitude mask 
+      self.hit_amp_mask = ((self.output_data['digitHitCleaningMask'] >> 1) & 1) == 0
+      # Charge mask 
+      charge = self.output_data['digitCharge']
+      self.hit_charge_mask = charge > 0
+      # Timing mask 
+      hit_time = self.output_data['digitTime']
+      # Event (fit) time correction
+      event_time = self.output_data['time_quadfitter']
+      event_time = ak.broadcast_arrays(hit_time, event_time)[1]
+      hit_time = hit_time - event_time   # subtract event (fit) time
+      # Time-of-flight correction 
+      hit_id = self.output_data['digitPMTID']
+      fitx = ak.broadcast_arrays(hit_id, self.output_data['x_quadfitter'])[1]
+      fity = ak.broadcast_arrays(hit_id, self.output_data['y_quadfitter'])[1]
+      fitz = ak.broadcast_arrays(hit_id, self.output_data['z_quadfitter'])[1]
+      pmtX = ak.Array(self.meta_data['pmtX'][0])
+      pmtY = ak.Array(self.meta_data['pmtY'][0])
+      pmtZ = ak.Array(self.meta_data['pmtZ'][0])
+      hitx_flat = pmtX[ak.flatten(hit_id)]
+      hity_flat = pmtY[ak.flatten(hit_id)]
+      hitz_flat = pmtZ[ak.flatten(hit_id)]
+      hitx = ak.unflatten(hitx_flat, ak.num(hit_id))
+      hity = ak.unflatten(hity_flat, ak.num(hit_id))
+      hitz = ak.unflatten(hitz_flat, ak.num(hit_id)) 
+      dist = np.sqrt((fitx - hitx)**2 + (fity - hity)**2 + (fitz - hitz)**2)
+      self.hit_tof = dist / 224 # speed of light in water [mm/ns]
+      hit_time = hit_time - self.hit_tof
+      self.hit_time_mask = (hit_time > time_cut[0]) & (hit_time < time_cut[1])
 
-        # get boolean mask array from metadata
-        #pmt_is_online = np.asarray(self.meta_data['pmtIsOnline'][0])  # shape (241,), bool
-        #pmt_is_online = np.asarray(self.pmt_is_online)  # shape (241,), bool
+    # step 1.5 verify timing corrections in step 1
+    def plot_timing_corrections(self, time_cut):
 
-        # Step 2: get jagged array of PMT IDs
-        ids = self.output_data['digitPMTID']  # shape [event][hit]
-
-        # Step 3: apply element-wise mapping using NumPy boolean mask and `ak.Array`
-        # We do this by converting to flat NumPy, indexing, and re-wrapping into the same structure
-        #flat_ids = ak.flatten(ids)                                # shape [total_hits]
-        #flat_mask = pmt_is_online[flat_ids]                        # shape [total_hits], bool
-        #hit_id_cut = ak.unflatten(flat_mask, ak.num(ids, axis=1))  # shape [event][hit]
-
-        # Make positive charge hit cut 
-        charges = self.output_data['digitCharge']
-        hit_charge_cut = charges > 0
-
-        # Make time cut
+        plt.figure(figsize=(12, 6))
+        # Raw times
         times = self.output_data['digitTime']
+        plt.hist(ak.flatten(times), bins=400, range=(-150, 150), histtype='step',label='Digit Hit Time', color='tab:blue')\
+        # Event (fit) time correction
         event_times = self.output_data['time_quadfitter']
         event_times = ak.broadcast_arrays(times, event_times)[1]
-        times = times - event_times
-        cut = [-10, 15]
-        hit_time_cut = (times > cut[0]) & (times < cut[1])
-
-        # Save important stuff
-        # self.hit_amp_cut = hit_amp_cut
-        #self.hit_id_cut = hit_id_cut
-        self.hit_charge_cut = hit_charge_cut
-        self.hit_time_cut = hit_time_cut
-
+        times_ev = times - event_times
+        plt.hist(ak.flatten(event_times), bins=400, range=(-150, 150), histtype='step', label='Reco Event Time', color='tab:red')
+        plt.hist(ak.flatten(times_ev), bins=400, range=(-150, 150), histtype='step', label='Digit Hit Time - Reco Event Time', color='tab:orange')
+        # Time-of-flight correction
+        times_ev_tof = times_ev - self.hit_tof
+        plt.hist(ak.flatten(times_ev_tof), bins=400, range=(-150, 150), histtype='step', label='Digit Hit Time - Reco Event Time - TOF', color='tab:green')
+        plt.axvspan(time_cut[0], time_cut[1], color='grey', alpha=0.2)
+        plt.xlabel('Hit Time [ns]')
+        plt.ylabel('Counts')
+        plt.title('Hit Times Across All Channels and Events')
+        plt.legend(fontsize=14)
+        plt.tight_layout()
+        plt.show()
+    
 
     # step 2
-    def make_nhit_masks(self):
+    def make_nhit_masks_and_plot_hit_cleaning_effect(self):
 
         # Get raw data
         charges = self.output_data['digitCharge']
 
-        # Apply hit cuts
-        #clean_charges = ak.mask(charges, self.hit_amp_cut & self.hit_charge_cut & self.hit_time_cut)
-        #clean_charges = ak.mask(charges, self.hit_id_cut & self.hit_charge_cut & self.hit_time_cut)
-        clean_charges = ak.mask(charges, self.hit_charge_cut & self.hit_time_cut)
+        # Apply hit cuts individually for diagnostics   
+        amp_charges = ak.mask(charges, self.hit_amp_mask)
+        charge_charges = ak.mask(charges, self.hit_charge_mask) 
+        time_charges = ak.mask(charges, self.hit_time_mask)
+        #id_charges = ak.mask(charges, self.hit_id_mask)
+
+        # Apply all hit cuts together
+        clean_charges = ak.mask(charges, self.hit_amp_mask & self.hit_time_mask & self.hit_charge_mask)
 
         # Calculate NHits
         raw_nhit = ak.count(charges, axis=1)
+        amp_nhit = ak.count(amp_charges, axis=1)
+        charge_nhit = ak.count(charge_charges, axis=1) 
+        time_nhit = ak.count(time_charges, axis=1)
+        #id_nhit = ak.count(id_charges, axis=1)
         clean_nhit = ak.count(clean_charges, axis=1)
+
+        # Save important stuff
+        self.clean_charges = clean_charges
+        self.clean_nhit = clean_nhit
+
+        # Flatten charges for plotting
+        charges = ak.to_numpy(ak.flatten(charges))
+        amp_charges = ak.to_numpy(ak.flatten(amp_charges))
+        charge_charges = ak.to_numpy(ak.flatten(charge_charges))
+        time_charges = ak.to_numpy(ak.flatten(time_charges))
+        #id_charges = ak.to_numpy(ak.flatten(id_charges))
+        clean_charges = ak.to_numpy(ak.flatten(clean_charges))
 
         # Make trigger type masks 
         prompt_min_nhit = 125
         delayed_min_nhit = 50
-
         prompt_raw_mask = raw_nhit >= prompt_min_nhit
         delayed_raw_mask = (raw_nhit >= delayed_min_nhit) & (raw_nhit < prompt_min_nhit)
-
         prompt_clean_mask = clean_nhit >= prompt_min_nhit
         delayed_clean_mask = (clean_nhit >= delayed_min_nhit) & (clean_nhit < prompt_min_nhit)
 
+        # Save important stuff
+        self.prompt_clean_mask = prompt_clean_mask 
+        self.delayed_clean_mask = delayed_clean_mask
+        self.prompt_raw_mask = prompt_raw_mask 
+        self.delayed_raw_mask = delayed_clean_mask
+
+
+        # For diagnostics and labeling the plot
         raw_prompt = ak.count(ak.mask(raw_nhit, prompt_raw_mask), axis=None)
         raw_delayed = ak.count(ak.mask(clean_nhit, delayed_raw_mask), axis=None)
-
         clean_prompt = ak.count(ak.mask(clean_nhit, prompt_clean_mask), axis=None)
         clean_delayed = ak.count(ak.mask(clean_nhit, delayed_clean_mask), axis=None)
 
@@ -653,24 +756,33 @@ class SimRun:
         max_nhit=200
         fontsize=20
         plt.figure(figsize=(10,5))
-        plt.hist(raw_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='black',linestyle='--',label=f"Before: {raw_prompt} prompt {raw_delayed} delayed");
-        plt.hist(clean_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='black',label=f"After: {clean_prompt} prompt {clean_delayed} delayed");
-        plt.title('EOS Water Fill Run 3046',fontsize=fontsize)
+        plt.hist(raw_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='black',label=f"Raw data")#: {raw_prompt} prompt {raw_delayed} delayed");
+        plt.hist(amp_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='green',label=f"After amplitude hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.hist(charge_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='blue',label=f"After charge hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.hist(time_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='orange',label=f"After time hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        #plt.hist(id_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='red',label=f"After ID hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.hist(clean_nhit,bins=max_nhit,range=(0,max_nhit),histtype='step',color='purple',label=f"After amplitude + charge + time hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.title('EOS Run 3056 (Water Fill)',fontsize=fontsize)
         plt.xlabel('NHits',fontsize=fontsize)
         plt.ylabel('Number of Events',fontsize=fontsize)
-        plt.axvspan(125,200,color='blue',alpha=0.3,label='Stopping Muon Candidates')
-        plt.axvspan(50,125,color='red',alpha=0.3,label='Michel Electron Candidates')
+        #plt.axvspan(125,200,color='blue',alpha=0.1,label='Stopping Muon Candidates')
+        #plt.axvspan(50,125,color='red',alpha=0.1,label='Michel Electron Candidates')
         plt.semilogy()
-        plt.legend(ncol=1,loc='upper center',bbox_to_anchor=(1.25,1),fontsize=15)
+        plt.legend(fontsize=14)
 
-        # Save important stuff
-        self.prompt_raw_mask = prompt_raw_mask 
-        self.delayed_raw_mask = delayed_clean_mask
-
-        self.clean_charges = clean_charges
-        self.clean_nhit = clean_nhit
-        self.prompt_clean_mask = prompt_clean_mask 
-        self.delayed_clean_mask = delayed_clean_mask
+        # Plot total charge
+        charge_range = (-10,10)
+        plt.figure(figsize=(10,5))
+        plt.hist(charges,bins=max_nhit,range=charge_range,histtype='step',color='black',label=f"Raw data")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.hist(amp_charges,bins=max_nhit,range=charge_range,histtype='step',color='green',label=f"After amplitude hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.hist(time_charges,bins=max_nhit,range=charge_range,histtype='step',color='orange',label=f"After time hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.hist(charge_charges,bins=max_nhit,range=charge_range,histtype='step',color='blue',label=f"After charge hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.hist(clean_charges,bins=max_nhit,range=charge_range,histtype='step',color='purple',label=f"After amplitude + time hit cut")#: {clean_prompt} prompt {clean_delayed} delayed");
+        plt.title('EOS Run 3056 (Water Fill)',fontsize=fontsize)
+        plt.xlabel('Digit Charge [pC]',fontsize=fontsize)
+        plt.ylabel('Number of Events',fontsize=fontsize)
+        plt.semilogy()
+        plt.legend(fontsize=14)
 
     # step 3 
     def make_deliverables(self):
@@ -724,32 +836,6 @@ class SimRun:
         plt.title("Final Delayed Events After All Cuts")
         plt.yscale('log')
         plt.show()
- 
-    def plot_timing_cut(self):
-
-        # Make time cut
-        times = self.output_data['digitTime']
-        event_times = self.output_data['time_quadfitter']
-        event_times = ak.broadcast_arrays(times, event_times)[1]
-        times = times - event_times
-        cut = [-10, 15]
-        hit_time_cut = (times > cut[0]) & (times < cut[1])
-        # Apply time cut
-        cut_times = ak.mask(times, hit_time_cut)
-
-        # Plot
-        plt.figure(figsize=(12, 6))
-        plt.hist(ak.flatten(times), bins=400, range=(-200, 200), histtype='step',label='Raw', color='tab:blue')
-        plt.hist(ak.flatten(cut_times), bins=400, range=(-200, 200),label='Filtered', color='tab:blue')
-        plt.axvspan(cut[0], cut[1], color='grey', alpha=0.2)
-        plt.xlabel('Hit Time [ns]')
-        plt.ylabel('Total Counts')
-        plt.title('Digit Times Across All Channels and Events')
-        plt.legend()
-        plt.tight_layout()
-        #plt.semilogy()
-        #plt.ylim(1e5.1e7)
-        plt.show()
         
     def create_michel_file(self, ofname):
         start = time.time()
@@ -774,7 +860,7 @@ class SimRun:
                 array = array + trig_times
             #FIXME better to do hit cleaning to all hit variables
             if key in ['digitPMTID', 'digitTime', 'digitCharge']:
-                array = ak.mask(array, self.hit_charge_cut & self.hit_time_cut)
+                array = ak.mask(array, self.hit_charge_mask & self.hit_time_mask & self.hit_amp_mask)
                 array = ak.drop_none(array)
             selected_output_arrays[key] = array[final_event_mask]
         
